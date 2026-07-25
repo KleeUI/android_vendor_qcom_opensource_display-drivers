@@ -2074,15 +2074,13 @@ static void dp_mst_display_hpd_irq(void *dp_display)
 
 	/* ack the request */
 	if (handled) {
-		rc = drm_dp_dpcd_writeb(mst->caps.drm_aux, esi_res, ack[1]);
+		rc = drm_dp_dpcd_write(mst->caps.drm_aux, esi_res, &esi[1], 3);
 
 		if (esi[1] & DP_UP_REQ_MSG_RDY)
 			dp_mst_clear_edid_cache(dp);
 
-		if (rc != 1)
+		if (rc != 3)
 			DP_ERR("dpcd esi_res failed. rlen=%d\n", rc);
-		else
-			drm_dp_mst_hpd_irq_send_new_request(&mst->mst_mgr);
 	}
 #endif
 
@@ -2230,4 +2228,3 @@ void dp_mst_deinit(struct dp_display *dp_display)
 
 	DP_MST_INFO("dp drm mst topology manager deinit completed\n");
 }
-

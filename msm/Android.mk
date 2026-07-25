@@ -28,15 +28,6 @@ ifeq ($(CONFIG_MSM_MMRM), y)
        KBUILD_OPTIONS += KBUILD_EXTRA_SYMBOLS+=$(PWD)/$(call intermediates-dir-for,DLKM,mmrm-module-symvers)/Module.symvers
 endif
 ifneq ($(TARGET_BOARD_PLATFORM), parrot)
-ifneq ($(TARGET_QCOM_SYNC_FENCE_DLKM), false)
-       KBUILD_OPTIONS += KBUILD_EXTRA_SYMBOLS+=$(PWD)/$(call intermediates-dir-for,DLKM,sync-fence-module-symvers)/Module.symvers
-endif
-ifneq ($(TARGET_QCOM_MSM_EXT_DISPLAY_DLKM), false)
-       KBUILD_OPTIONS += KBUILD_EXTRA_SYMBOLS+=$(PWD)/$(call intermediates-dir-for,DLKM,msm-ext-disp-module-symvers)/Module.symvers
-endif
-ifneq ($(TARGET_QCOM_HW_FENCE_DLKM), false)
-       KBUILD_OPTIONS += KBUILD_EXTRA_SYMBOLS+=$(PWD)/$(call intermediates-dir-for,DLKM,hw-fence-module-symvers)/Module.symvers
-endif
        ifeq ($(CONFIG_HDCP_QSEECOM), y)
        KBUILD_OPTIONS += KBUILD_EXTRA_SYMBOLS+=$(PWD)/$(call intermediates-dir-for,DLKM,sec-module-symvers)/Module.symvers
        endif
@@ -59,26 +50,17 @@ ifeq ($(CONFIG_MSM_MMRM), y)
 endif
 ifneq ($(TARGET_BOARD_PLATFORM), parrot)
 ifneq ($(TARGET_QCOM_SYNC_FENCE_DLKM), false)
-       LOCAL_REQUIRED_MODULES    += sync-fence-module-symvers
+       KBUILD_REQUIRED_KOS += sync_fence.ko
 endif
 ifneq ($(TARGET_QCOM_MSM_EXT_DISPLAY_DLKM), false)
-       LOCAL_REQUIRED_MODULES    += msm-ext-disp-module-symvers
+       KBUILD_REQUIRED_KOS += msm_ext_display.ko
 endif
 ifneq ($(TARGET_QCOM_HW_FENCE_DLKM), false)
-       LOCAL_REQUIRED_MODULES    += hw-fence-module-symvers
+       KBUILD_REQUIRED_KOS += msm_hw_fence.ko
 endif
        ifeq ($(CONFIG_HDCP_QSEECOM), y)
        LOCAL_REQUIRED_MODULES    += sec-module-symvers
        endif
-ifneq ($(TARGET_QCOM_SYNC_FENCE_DLKM), false)
-       LOCAL_ADDITIONAL_DEPENDENCIES += $(call intermediates-dir-for,DLKM,sync-fence-module-symvers)/Module.symvers
-endif
-ifneq ($(TARGET_QCOM_MSM_EXT_DISPLAY_DLKM), false)
-       LOCAL_ADDITIONAL_DEPENDENCIES += $(call intermediates-dir-for,DLKM,msm-ext-disp-module-symvers)/Module.symvers
-endif
-ifneq ($(TARGET_QCOM_HW_FENCE_DLKM), false)
-       LOCAL_ADDITIONAL_DEPENDENCIES += $(call intermediates-dir-for,DLKM,hw-fence-module-symvers)/Module.symvers
-endif
        ifeq ($(CONFIG_HDCP_QSEECOM), y)
        LOCAL_ADDITIONAL_DEPENDENCIES += $(call intermediates-dir-for,DLKM,sec-module-symvers)/Module.symvers
        endif
