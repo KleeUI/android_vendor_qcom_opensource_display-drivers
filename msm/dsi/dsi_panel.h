@@ -185,6 +185,7 @@ struct drm_panel_esd_config {
 
 	enum esd_check_status_mode status_mode;
 	struct dsi_panel_cmd_set status_cmd;
+	struct dsi_panel_cmd_set status_offset_cmd;
 	u32 *status_cmds_rlen;
 	u32 *status_valid_params;
 	u32 *status_value;

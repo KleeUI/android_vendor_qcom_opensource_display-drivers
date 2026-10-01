@@ -757,16 +757,58 @@ static void dsi_display_set_cmd_tx_ctrl_flags(struct dsi_display *display,
 	cmd->ctrl_flags |= flags;
 }
 
+/* Caller holds panel_lock with ESD clocks on and error IRQs masked. */
+static int dsi_display_send_status_offset(struct dsi_display_ctrl *ctrl,
+		struct dsi_display *display)
+{
+	const struct dsi_panel_cmd_set *set =
+		&display->panel->esd_config.status_offset_cmd;
+	struct dsi_cmd_desc cmd;
+	u32 i;
+	int rc;
+
+	if (!set->count)
+		return set->cmds ? -EINVAL : 0;
+	if (!set->cmds)
+		return -EINVAL;
+
+	for (i = 0; i < set->count; i++) {
+		cmd = set->cmds[i];
+		cmd.ctrl_flags = 0;
+		cmd.msg.flags |= MIPI_DSI_MSG_UNICAST_COMMAND;
+		if (set->state == DSI_CMD_SET_STATE_LP)
+			cmd.msg.flags |= MIPI_DSI_MSG_USE_LPM;
+		else
+			cmd.msg.flags &= ~MIPI_DSI_MSG_USE_LPM;
+
+		dsi_display_set_cmd_tx_ctrl_flags(display, &cmd);
+		/* Offset programming must finish before the status read. */
+		cmd.ctrl_flags &= ~DSI_CTRL_CMD_ASYNC_WAIT;
+		rc = dsi_ctrl_transfer_prepare(ctrl->ctrl, cmd.ctrl_flags);
+		if (rc)
+			return rc;
+		rc = dsi_ctrl_cmd_transfer(ctrl->ctrl, &cmd);
+		dsi_ctrl_transfer_unprepare(ctrl->ctrl, cmd.ctrl_flags);
+		if (rc < 0)
+			return rc;
+		if (cmd.post_wait_ms)
+			usleep_range(cmd.post_wait_ms * 1000,
+					cmd.post_wait_ms * 1000 + 10);
+	}
+	return 0;
+}
+
 static int dsi_display_read_status(struct dsi_display_ctrl *ctrl,
 		struct dsi_display *display)
 {
-	int i, rc = 0, count = 0, start = 0, *lenp;
+	int i, rc = 0, count = 0, start = 0;
+	u32 *lenp;
 	struct drm_panel_esd_config *config;
 	struct dsi_cmd_desc *cmds;
 	struct dsi_panel *panel;
 	u32 flags = 0;
 
-	if (!display->panel || !ctrl || !ctrl->ctrl)
+	if (!display || !display->panel || !ctrl || !ctrl->ctrl)
 		return -EINVAL;
 
 	panel = display->panel;
@@ -787,6 +829,15 @@ static int dsi_display_read_status(struct dsi_display_ctrl *ctrl,
 	count = config->status_cmd.count;
 	cmds = config->status_cmd.cmds;
 	flags = DSI_CTRL_CMD_READ;
+	if (!count || !cmds || !lenp || !config->status_cmds_rlen ||
+			!config->status_buf || !config->return_buf)
+		return -EINVAL;
+
+	rc = dsi_display_send_status_offset(ctrl, display);
+	if (rc < 0) {
+		DSI_ERR("status offset transfer failed rc=%d\n", rc);
+		return rc;
+	}
 
 	for (i = 0; i < count; ++i) {
 		memset(config->status_buf, 0x0, SZ_4K);
@@ -815,6 +866,8 @@ static int dsi_display_read_status(struct dsi_display_ctrl *ctrl,
 		}
 
 		dsi_ctrl_transfer_unprepare(ctrl->ctrl, cmds[i].ctrl_flags);
+		if (rc <= 0)
+			return rc;
 	}
 
 	return rc;

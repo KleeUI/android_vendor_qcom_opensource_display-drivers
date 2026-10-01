@@ -2844,6 +2844,46 @@ error:
 	return rc;
 }
 
+static int dsi_panel_apply_l3_dsc_config(struct dsi_display_mode *mode,
+		struct dsi_parser_utils *utils, void *panel_node)
+{
+	struct msm_display_dsc_info *info;
+	struct drm_dsc_config *dsc;
+	u32 panel_id[2];
+	int rc;
+
+	if (!mode || !mode->priv_info || !utils || !panel_node)
+		return -EINVAL;
+	if (!mode->priv_info->dsc_enabled)
+		return 0;
+	if (!utils->find_property(panel_node, "mi,panel-id", NULL))
+		return 0;
+	if (utils->count_u32_elems(panel_node, "mi,panel-id") != 2)
+		return -EINVAL;
+	rc = utils->read_u32_array(panel_node, "mi,panel-id", panel_id, 2);
+	if (rc)
+		return rc;
+	if (panel_id[0] != 0x00004C33 || panel_id[1] != 0x00420200)
+		return 0;
+
+	info = &mode->priv_info->dsc;
+	dsc = &info->config;
+	if (dsc->dsc_version_major != 1 || dsc->dsc_version_minor != 1 ||
+		info->scr_rev != 0 || dsc->bits_per_component != 10 ||
+		dsc->bits_per_pixel != (8 << 4) || dsc->native_422 ||
+		dsc->native_420 || dsc->simple_422 ||
+		info->chroma_format != MSM_CHROMA_444 ||
+		info->source_color_space != MSM_RGB)
+		return 0;
+
+	/* Xiaomi L3/NVT DSC 1.1 10bpc/8bpp: only range 0 differs.
+	 * Keep the shared config consistent for encoder registers and PPS.
+	 * Do not change the generic table used by other panels.
+	 */
+	dsc->rc_range_params[0].range_max_qp = 8;
+	return 0;
+}
+
 static int dsi_panel_parse_vdc_params(struct dsi_display_mode *mode,
 	struct dsi_parser_utils *utils, int traffic_mode)
 {
@@ -3350,6 +3390,8 @@ static bool dsi_panel_parse_esd_status_len(struct dsi_parser_utils *utils,
 	if (!utils->find_property(utils->data, prop_key, &tmp))
 		return false;
 
+	if (tmp <= 0 || tmp % sizeof(u32))
+		return false;
 	tmp /= sizeof(u32);
 	if (tmp != cmd_cnt) {
 		DSI_ERR("request property(%d) do not match cmd count(%d)\n",
@@ -3373,6 +3415,83 @@ static bool dsi_panel_parse_esd_status_len(struct dsi_parser_utils *utils,
 	return true;
 }
 
+static void dsi_panel_esd_cmds_release(struct dsi_panel_cmd_set *set)
+{
+	if (set->cmds) {
+		dsi_panel_destroy_cmd_packets(set);
+		kfree(set->cmds);
+	}
+	memset(set, 0, sizeof(*set));
+}
+
+/* ESD sets own every payload, including partially constructed sets. */
+static int dsi_panel_parse_esd_cmds(struct dsi_panel_cmd_set *set,
+		struct dsi_parser_utils *utils, const char *property,
+		const char *state_property, bool optional)
+{
+	const u8 *data;
+	const char *state;
+	u32 length = 0, pos = 0, count = 0, size, i;
+	int rc;
+
+	if (set->cmds || set->count)
+		return -EINVAL;
+	if (!utils->find_property(utils->data, property, NULL))
+		return optional ? 0 : -EINVAL;
+	data = utils->get_property(utils->data, property, &length);
+	if (!data || !length)
+		return -EINVAL;
+
+	set->state = DSI_CMD_SET_STATE_LP;
+	if (utils->find_property(utils->data, state_property, NULL)) {
+		rc = utils->read_string(utils->data, state_property, &state);
+		if (rc)
+			return rc;
+		if (!strcmp(state, "dsi_hs_mode"))
+			set->state = DSI_CMD_SET_STATE_HS;
+		else if (strcmp(state, "dsi_lp_mode"))
+			return -EINVAL;
+	}
+
+	/* Reject truncated headers/payloads and use unsigned length bytes. */
+	while (pos < length) {
+		if (length - pos < 7)
+			return -EINVAL;
+		size = ((u32)data[pos + 5] << 8) | data[pos + 6];
+		if (size > length - pos - 7)
+			return -EINVAL;
+		pos += 7 + size;
+		count++;
+	}
+
+	set->cmds = kcalloc(count, sizeof(*set->cmds), GFP_KERNEL);
+	if (!set->cmds)
+		return -ENOMEM;
+	set->count = count;
+	set->type = DSI_CMD_SET_PANEL_STATUS;
+	pos = 0;
+	for (i = 0; i < count; i++) {
+		struct dsi_cmd_desc *cmd = &set->cmds[i];
+
+		size = ((u32)data[pos + 5] << 8) | data[pos + 6];
+		cmd->msg.type = data[pos];
+		cmd->msg.channel = data[pos + 2];
+		cmd->msg.flags = data[pos + 3];
+		cmd->last_command = !(cmd->msg.flags & MIPI_DSI_MSG_BATCH_COMMAND);
+		cmd->post_wait_ms = data[pos + 4];
+		cmd->msg.tx_len = size;
+		if (size) {
+			cmd->msg.tx_buf = kmemdup(data + pos + 7, size, GFP_KERNEL);
+			if (!cmd->msg.tx_buf) {
+				dsi_panel_esd_cmds_release(set);
+				return -ENOMEM;
+			}
+		}
+		pos += 7 + size;
+	}
+	return 0;
+}
+
 static void dsi_panel_esd_config_deinit(struct drm_panel_esd_config *esd_config)
 {
 	kfree(esd_config->status_buf);
@@ -3380,17 +3499,24 @@ static void dsi_panel_esd_config_deinit(struct drm_panel_esd_config *esd_config)
 	kfree(esd_config->status_value);
 	kfree(esd_config->status_valid_params);
 	kfree(esd_config->status_cmds_rlen);
-	kfree(esd_config->status_cmd.cmds);
+	dsi_panel_esd_cmds_release(&esd_config->status_cmd);
+	dsi_panel_esd_cmds_release(&esd_config->status_offset_cmd);
+	esd_config->status_buf = NULL;
+	esd_config->return_buf = NULL;
+	esd_config->status_value = NULL;
+	esd_config->status_valid_params = NULL;
+	esd_config->status_cmds_rlen = NULL;
+	esd_config->groups = 0;
 }
 
 int dsi_panel_parse_esd_reg_read_configs(struct dsi_panel *panel)
 {
 	struct drm_panel_esd_config *esd_config;
 	int rc = 0;
-	u32 tmp;
+	int tmp = 0;
 	u32 i, status_len, *lenp;
 	struct property *data;
-	struct dsi_parser_utils *utils = &panel->utils;
+	struct dsi_parser_utils *utils;
 
 	if (!panel) {
 		DSI_ERR("Invalid Params\n");
@@ -3398,14 +3524,21 @@ int dsi_panel_parse_esd_reg_read_configs(struct dsi_panel *panel)
 	}
 
 	esd_config = &panel->esd_config;
-	if (!esd_config)
-		return -EINVAL;
-
-	dsi_panel_parse_cmd_sets_sub(&esd_config->status_cmd,
-				DSI_CMD_SET_PANEL_STATUS, utils);
-	if (!esd_config->status_cmd.count) {
+	utils = &panel->utils;
+	rc = dsi_panel_parse_esd_cmds(&esd_config->status_cmd, utils,
+			"qcom,mdss-dsi-panel-status-command",
+			"qcom,mdss-dsi-panel-status-command-state", false);
+	if (rc || !esd_config->status_cmd.count || !esd_config->status_cmd.cmds) {
 		DSI_ERR("panel status command parsing failed\n");
-		rc = -EINVAL;
+		if (!rc)
+			rc = -EINVAL;
+		goto error;
+	}
+	rc = dsi_panel_parse_esd_cmds(&esd_config->status_offset_cmd, utils,
+			"qcom,mdss-dsi-panel-status-offset-command",
+			"qcom,mdss-dsi-panel-status-offset-command-state", true);
+	if (rc) {
+		DSI_ERR("panel status offset parsing failed, rc=%d\n", rc);
 		goto error;
 	}
 
@@ -3415,28 +3548,46 @@ int dsi_panel_parse_esd_reg_read_configs(struct dsi_panel *panel)
 				esd_config->status_cmd.count)) {
 		DSI_ERR("Invalid status read length\n");
 		rc = -EINVAL;
-		goto error1;
+		goto error;
 	}
 
-	if (dsi_panel_parse_esd_status_len(utils,
+	for (i = 0; i < esd_config->status_cmd.count; i++) {
+		if (!esd_config->status_cmds_rlen[i] ||
+				esd_config->status_cmds_rlen[i] > SZ_4K) {
+			rc = -EINVAL;
+			goto error;
+		}
+	}
+
+	if (utils->find_property(utils->data,
+			"qcom,mdss-dsi-panel-status-valid-params", NULL)) {
+		if (!dsi_panel_parse_esd_status_len(utils,
 		"qcom,mdss-dsi-panel-status-valid-params",
 			&panel->esd_config.status_valid_params,
 				esd_config->status_cmd.count)) {
+			rc = -EINVAL;
+			goto error;
+		}
 		if (!dsi_panel_parse_esd_check_valid_params(panel,
 					esd_config->status_cmd.count)) {
 			rc = -EINVAL;
-			goto error2;
+			goto error;
 		}
 	}
 
 	status_len = 0;
 	lenp = esd_config->status_valid_params ?: esd_config->status_cmds_rlen;
-	for (i = 0; i < esd_config->status_cmd.count; ++i)
+	for (i = 0; i < esd_config->status_cmd.count; ++i) {
+		if (lenp[i] > SZ_4K - status_len) {
+			rc = -EINVAL;
+			goto error;
+		}
 		status_len += lenp[i];
+	}
 
 	if (!status_len) {
 		rc = -EINVAL;
-		goto error2;
+		goto error;
 	}
 
 	/*
@@ -3449,34 +3600,36 @@ int dsi_panel_parse_esd_reg_read_configs(struct dsi_panel *panel)
 	 */
 	data = utils->find_property(utils->data,
 			"qcom,mdss-dsi-panel-status-value", &tmp);
+	if (IS_ERR_OR_NULL(data) || tmp <= 0 || tmp % sizeof(u32)) {
+		rc = -EINVAL;
+		goto error;
+	}
 	tmp /= sizeof(u32);
 	if (!IS_ERR_OR_NULL(data) && tmp != 0 && (tmp % status_len) == 0) {
 		esd_config->groups = tmp / status_len;
 	} else {
 		DSI_ERR("error parse panel-status-value\n");
 		rc = -EINVAL;
-		goto error2;
+		goto error;
 	}
 
-	esd_config->status_value =
-		kzalloc(sizeof(u32) * status_len * esd_config->groups,
-			GFP_KERNEL);
+	esd_config->status_value = kcalloc(tmp, sizeof(u32), GFP_KERNEL);
 	if (!esd_config->status_value) {
 		rc = -ENOMEM;
-		goto error2;
+		goto error;
 	}
 
 	esd_config->return_buf = kcalloc(status_len * esd_config->groups,
 			sizeof(unsigned char), GFP_KERNEL);
 	if (!esd_config->return_buf) {
 		rc = -ENOMEM;
-		goto error3;
+		goto error;
 	}
 
 	esd_config->status_buf = kzalloc(SZ_4K, GFP_KERNEL);
 	if (!esd_config->status_buf) {
 		rc = -ENOMEM;
-		goto error4;
+		goto error;
 	}
 
 	rc = utils->read_u32_array(utils->data,
@@ -3484,22 +3637,13 @@ int dsi_panel_parse_esd_reg_read_configs(struct dsi_panel *panel)
 		esd_config->status_value, esd_config->groups * status_len);
 	if (rc) {
 		DSI_DEBUG("error reading panel status values\n");
-		memset(esd_config->status_value, 0,
-				esd_config->groups * status_len);
+		goto error;
 	}
 
 	return 0;
 
-error4:
-	kfree(esd_config->return_buf);
-error3:
-	kfree(esd_config->status_value);
-error2:
-	kfree(esd_config->status_valid_params);
-	kfree(esd_config->status_cmds_rlen);
-error1:
-	kfree(esd_config->status_cmd.cmds);
 error:
+	dsi_panel_esd_config_deinit(esd_config);
 	return rc;
 }
 
@@ -3729,8 +3873,10 @@ struct dsi_panel *dsi_panel_get(struct device *parent,
 		DSI_DEBUG("failed to get dms info, rc=%d\n", rc);
 
 	rc = dsi_panel_parse_esd_config(panel);
-	if (rc)
-		DSI_DEBUG("failed to parse esd config, rc=%d\n", rc);
+	if (rc) {
+		DSI_ERR("failed to parse esd config, rc=%d\n", rc);
+		goto error;
+	}
 
 	rc = dsi_panel_vreg_get(panel);
 	if (rc) {
@@ -3750,6 +3896,7 @@ struct dsi_panel *dsi_panel_get(struct device *parent,
 
 	return panel;
 error:
+	dsi_panel_esd_config_deinit(&panel->esd_config);
 	kfree(panel);
 	return ERR_PTR(rc);
 }
@@ -4237,6 +4384,12 @@ int dsi_panel_get_mode(struct dsi_panel *panel,
 		rc = dsi_panel_parse_dsc_params(mode, utils);
 		if (rc) {
 			DSI_ERR("failed to parse dsc params, rc=%d\n", rc);
+			goto parse_fail;
+		}
+
+		rc = dsi_panel_apply_l3_dsc_config(mode, utils, utils_data);
+		if (rc) {
+			DSI_ERR("failed to apply L3 DSC config, rc=%d\n", rc);
 			goto parse_fail;
 		}
 
